@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 const REMINDERS = [
-  { beforeMs: 10 * 60 * 1000, label: "10 分鐘", icon: "⚠️" },
+  
   { beforeMs: 5 * 60 * 1000, label: "5 分鐘", icon: "🔥" },
   { beforeMs: 1 * 60 * 1000, label: "1 分鐘", icon: "🚨" },
 ];
