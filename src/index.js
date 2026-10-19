@@ -379,9 +379,7 @@ export class BossReminder extends DurableObject {
 
 
       const text =
-        `${r.icon} **${job.bossName} 出現提醒**\n` +
-        `⏰ 預計出現：**${time}**（台北時間）\n` +
-        `🔔 本次為提前 **${r.label}**提醒`;
+        `${r.icon} **${job.bossName}**｜預計 ${time}`;
 
       await discordPush(
         this.env.DISCORD_WEBHOOK_URL,
