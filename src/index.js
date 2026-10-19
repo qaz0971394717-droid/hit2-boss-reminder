@@ -352,12 +352,6 @@ export class BossReminder extends DurableObject {
             timeZone:
               "Asia/Taipei",
 
-            month:
-              "2-digit",
-
-            day:
-              "2-digit",
-
             hour:
               "2-digit",
 
@@ -376,7 +370,9 @@ export class BossReminder extends DurableObject {
 
 
       const text =
-        `${r.icon} **${job.bossName}**｜預計 ${time}`;
+        `${r.icon} **BOSS 出現提醒**\n` +
+        `**${job.bossName}** 即將於 **${r.label}後**出現\n` +
+        `⏰ 出現時間：**${time}**`;
 
       await discordPush(
         this.env.DISCORD_WEBHOOK_URL,
