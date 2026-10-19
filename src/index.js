@@ -352,9 +352,6 @@ export class BossReminder extends DurableObject {
             timeZone:
               "Asia/Taipei",
 
-            year:
-              "numeric",
-
             month:
               "2-digit",
 
