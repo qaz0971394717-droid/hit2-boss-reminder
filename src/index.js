@@ -1,9 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 
-const REMINDERS = [
-  { beforeMs: 5 * 60 * 1000, label: "5 分鐘", icon: "🔥" },
-  { beforeMs: 1 * 60 * 1000, label: "1 分鐘", icon: "🚨" },
-];
+import {
+  REMINDERS,
+  LAST_RETRY_COUNT,
+  processAlarm,
+} from "./reminder-core.js";
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -28,9 +29,13 @@ function authorized(request, env) {
 
 async function discordPush(webhookUrl, text) {
   if (!webhookUrl) {
-    throw new Error(
+    const error = new Error(
       "DISCORD_WEBHOOK_URL is not configured"
     );
+
+    error.permanent = true;
+
+    throw error;
   }
 
   const response = await fetch(
@@ -47,10 +52,90 @@ async function discordPush(webhookUrl, text) {
   );
 
   if (!response.ok) {
-    throw new Error(
-      `Discord Webhook failed: ${response.status} ${await response.text()}`
+    const body = await response.text();
+
+    const error = new Error(
+      `Discord Webhook failed: ${response.status} ${body}`
     );
+
+    // 429 / 408 / 5xx 可以再試；其他 4xx（網址失效、權限）重試也沒用
+    error.permanent =
+      response.status >= 400 &&
+      response.status < 500 &&
+      response.status !== 429 &&
+      response.status !== 408;
+
+    if (response.status === 429) {
+      try {
+        const wait = Number(JSON.parse(body).retry_after);
+
+        if (Number.isFinite(wait) && wait > 0) {
+          error.retryAfterMs = Math.ceil(wait * 1000);
+        }
+      } catch {
+        // retry_after 解析失敗就用預設等待時間
+      }
+    }
+
+    throw error;
   }
+}
+
+
+// =========================================================
+// 提醒最終失敗時通知維護者（選用）
+//
+// 需要設定 OPS_ALERT_URL 與 OPS_ALERT_KEY，
+// 沒設定就只寫入 Workers 日誌，不影響提醒本身。
+// =========================================================
+
+async function notifyOps(env, failure) {
+
+  console.error(
+    "Discord reminder FAILED permanently:",
+    failure.bossName,
+    failure.label,
+    failure.error
+  );
+
+  if (!env.OPS_ALERT_URL || !env.OPS_ALERT_KEY) {
+    return;
+  }
+
+  const digest = new Uint8Array(
+    await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(
+        `reminder:${failure.bossName}:${failure.label}:${failure.respawnAt}`
+      )
+    )
+  );
+
+  const h = [...digest]
+    .map((x) => x.toString(16).padStart(2, "0"))
+    .join("");
+
+  const retryKey =
+    `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-a${h.slice(17, 20)}-${h.slice(20, 32)}`;
+
+  await fetch(
+    env.OPS_ALERT_URL,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.OPS_ALERT_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        target: "production",
+        kind: "alert",
+        message:
+          `Discord 提醒未送出：${failure.bossName}（${failure.label}前）`,
+        retryKey,
+      }),
+      signal: AbortSignal.timeout(15000),
+    }
+  );
 }
 
 
@@ -246,7 +331,7 @@ export class BossReminder extends DurableObject {
   // Alarm 到時間
   // =======================================================
 
-  async alarm() {
+  async alarm(alarmInfo) {
 
     const job =
       await this.ctx.storage.get(
@@ -315,75 +400,66 @@ export class BossReminder extends DurableObject {
     }
 
 
-    const now =
-      Date.now();
-
-
-    const due =
-      job.pending.filter(
-        (r) =>
-          r.at <= now + 3000
-      );
-
-
-    job.pending =
-      job.pending.filter(
-        (r) =>
-          r.at > now + 3000
-      );
-
-
     // -------------------------------------------------------
     // 發送 Discord 提醒
+    //
+    // 已重生的不發、過時的不發、每發一則就存檔，
+    // 失敗會重試，最後仍失敗才放棄並通知。
     // -------------------------------------------------------
 
-    for (const r of due) {
+    const outcome = await processAlarm({
 
-      const respawn =
-        new Date(
-          job.respawnAt
-        );
+      job,
 
+      send: (text) =>
+        discordPush(
+          this.env.DISCORD_WEBHOOK_URL,
+          text
+        ),
 
-      const time =
-        new Intl.DateTimeFormat(
-          "zh-TW",
-          {
-            timeZone:
-              "Asia/Taipei",
+      persist: (next) =>
+        this.ctx.storage.put(
+          "job",
+          next
+        ),
 
-            hour:
-              "2-digit",
+      notify: (failure) =>
+        notifyOps(
+          this.env,
+          failure
+        ),
 
-            minute:
-              "2-digit",
-
-            second:
-              "2-digit",
-
-            hour12:
-              false,
-          }
-        ).format(
-          respawn
-        );
+      isLastRetry:
+        (alarmInfo?.retryCount ?? 0) >=
+        LAST_RETRY_COUNT,
+    });
 
 
-      const text =
-        `${r.icon} **BOSS 出現提醒**\n` +
-        `**${job.bossName}** 即將於 **${r.label}後**出現\n` +
-        `⏰ 出現時間：**${time}**`;
-
-      await discordPush(
-        this.env.DISCORD_WEBHOOK_URL,
-        text
-      );
-
+    for (const item of outcome.sent) {
 
       console.log(
         "Discord reminder sent:",
         job.bossName,
-        r.label
+        item.label
+      );
+    }
+
+    for (const item of outcome.skipped) {
+
+      console.log(
+        "Discord reminder skipped:",
+        job.bossName,
+        item.label,
+        item.reason
+      );
+    }
+
+
+    // 交給 Cloudflare 稍後重試這個 alarm（已發送的不會重複）
+    if (outcome.retry) {
+
+      throw new Error(
+        "Discord reminder delivery failed; alarm will retry"
       );
     }
 
@@ -393,12 +469,6 @@ export class BossReminder extends DurableObject {
     // -------------------------------------------------------
 
     if (job.pending.length) {
-
-      await this.ctx.storage.put(
-        "job",
-        job
-      );
-
 
       await this.setNextAlarm(
         job

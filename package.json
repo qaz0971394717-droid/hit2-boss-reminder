@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node --import ./test/register.mjs --test test/core.test.js test/durable-object.test.js"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"
