@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  MAX_LATE_MS,
   REMINDERS,
   buildReminderText,
+  normalizeJob,
   processAlarm,
-  remainingLabel,
   sendWithRetry,
 } from "../src/reminder-core.js";
 
@@ -23,87 +24,85 @@ function makeJob(overrides = {}) {
 }
 
 function harness({ nowMs, failures = [] } = {}) {
-  const state = { now: nowMs, sent: [], persisted: [], notified: [], calls: 0, sleeps: [] };
+  const state = { now: nowMs, sent: [], notified: [], calls: 0, sleeps: [] };
   const queue = [...failures];
 
   return {
     state,
     args: {
       now: () => state.now,
-      sleep: async (ms) => { state.sleeps.push(ms); },
+      sleep: async (ms) => { state.sleeps.push(ms); state.now += ms; },
       send: async (text) => {
         state.calls++;
         const next = queue.shift();
         if (next) throw next;
-        state.sent.push(text);
+        state.sent.push({ text, at: state.now });
       },
-      persist: async (job) => { state.persisted.push(job.pending.length); },
+      persist: async () => {},
       notify: async (failure) => { state.notified.push(failure); },
     },
   };
 }
 
-test("on-time 5 minute reminder keeps the approved wording", async () => {
+test("there is exactly one reminder and it fires at the respawn moment", () => {
+  assert.equal(REMINDERS.length, 1);
+  assert.equal(REMINDERS[0].beforeMs, 0);
+});
+
+test("message states the boss is respawned and the exact respawn time", () => {
+  const text = buildReminderText(makeJob());
+  assert.equal(text, "⚔️ **大象H 已重生**\n⏰ 重生時間：**12:00:00**");
+});
+
+test("an on-time alarm sends one message and finishes the job", async () => {
   const job = makeJob();
-  const h = harness({ nowMs: RESPAWN - 5 * 60000 });
+  const h = harness({ nowMs: RESPAWN });
   const result = await processAlarm({ job, ...h.args });
   assert.equal(h.state.sent.length, 1);
-  assert.match(h.state.sent[0], /🔥 \*\*BOSS 出現提醒\*\*/);
-  assert.match(h.state.sent[0], /\*\*大象H\*\* 即將於 \*\*5 分鐘後\*\*出現/);
-  assert.match(h.state.sent[0], /⏰ 出現時間：\*\*12:00:00\*\*/);
-  assert.deepEqual(result.sent, [{ label: "5 分鐘" }]);
+  assert.match(h.state.sent[0].text, /大象H 已重生/);
+  assert.equal(job.pending.length, 0);
+  assert.equal(result.retry, false);
+});
+
+test("an alarm that fires slightly early waits until the exact respawn time", async () => {
+  const job = makeJob();
+  const h = harness({ nowMs: RESPAWN - 1500 });
+  await processAlarm({ job, ...h.args });
+  assert.deepEqual(h.state.sleeps, [1500]);
+  assert.equal(h.state.sent[0].at, RESPAWN, "must not be sent before the respawn time");
+});
+
+test("an alarm more than 3 seconds early does nothing yet", async () => {
+  const job = makeJob();
+  const h = harness({ nowMs: RESPAWN - 10000 });
+  await processAlarm({ job, ...h.args });
+  assert.equal(h.state.calls, 0);
   assert.equal(job.pending.length, 1);
 });
 
-test("on-time 1 minute reminder keeps the approved wording", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[1], at: RESPAWN - 60000 }] });
-  const h = harness({ nowMs: RESPAWN - 60000 + 1500 });
-  await processAlarm({ job, ...h.args });
-  assert.match(h.state.sent[0], /🚨/);
-  assert.match(h.state.sent[0], /\*\*1 分鐘後\*\*出現/);
-  assert.equal(job.pending.length, 0);
-});
-
-test("a boss that already respawned gets no reminder", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[1], at: RESPAWN - 60000 }] });
-  for (const late of [0, 1, 500, 90000]) {
-    const j = structuredClone(job);
+test("a late alarm still sends, and the text shows the real respawn time", async () => {
+  for (const late of [1000, 30000, 120000, MAX_LATE_MS]) {
+    const job = makeJob();
     const h = harness({ nowMs: RESPAWN + late });
-    const result = await processAlarm({ job: j, ...h.args });
-    assert.equal(h.state.calls, 0, `late=${late}`);
-    assert.equal(result.skipped[0].reason, "respawned");
-    assert.equal(j.pending.length, 0);
+    await processAlarm({ job, ...h.args });
+    assert.equal(h.state.sent.length, 1, `late=${late}`);
+    assert.match(h.state.sent[0].text, /重生時間：\*\*12:00:00\*\*/);
   }
 });
 
-test("a late reminder states the real remaining time, not the original label", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[1], at: RESPAWN - 60000 }] });
-  const h = harness({ nowMs: RESPAWN - 20000 });
-  await processAlarm({ job, ...h.args });
-  assert.match(h.state.sent[0], /\*\*20 秒後\*\*出現/);
-  assert.doesNotMatch(h.state.sent[0], /1 分鐘/);
-});
-
-test("a late 5 minute reminder rounds up to whole minutes", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[0], at: RESPAWN - 300000 }] });
-  const h = harness({ nowMs: RESPAWN - 150000 });
-  await processAlarm({ job, ...h.args });
-  assert.match(h.state.sent[0], /\*\*3 分鐘後\*\*出現/);
-});
-
-test("both reminders due at once send only the latest one", async () => {
+test("more than 5 minutes late is not sent but is reported", async () => {
   const job = makeJob();
-  const h = harness({ nowMs: RESPAWN - 20000 });
+  const h = harness({ nowMs: RESPAWN + MAX_LATE_MS + 1000 });
   const result = await processAlarm({ job, ...h.args });
-  assert.equal(h.state.sent.length, 1);
-  assert.match(h.state.sent[0], /\*\*20 秒後\*\*出現/);
-  assert.deepEqual(result.skipped, [{ label: "5 分鐘", reason: "superseded" }]);
+  assert.equal(h.state.calls, 0);
+  assert.equal(result.failed[0].reason, "too-late");
+  assert.equal(h.state.notified.length, 1);
   assert.equal(job.pending.length, 0);
 });
 
 test("a transient failure is retried inside the alarm and sent once", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[0], at: RESPAWN - 300000 }] });
-  const h = harness({ nowMs: RESPAWN - 300000, failures: [new Error("503"), new Error("503")] });
+  const job = makeJob();
+  const h = harness({ nowMs: RESPAWN, failures: [new Error("503"), new Error("503")] });
   const result = await processAlarm({ job, ...h.args });
   assert.equal(h.state.calls, 3);
   assert.equal(h.state.sent.length, 1);
@@ -120,50 +119,55 @@ test("rate limit waits the Retry-After time but never more than 5 seconds", asyn
   assert.deepEqual(h.state.sleeps, [2500, 5000]);
 });
 
-test("persistent failure asks Cloudflare to retry and keeps the reminder", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[0], at: RESPAWN - 300000 }] });
+test("persistent failure asks Cloudflare to retry and keeps the notification", async () => {
+  const job = makeJob();
   const err = new Error("503");
-  const h = harness({ nowMs: RESPAWN - 300000, failures: [err, err, err] });
+  const h = harness({ nowMs: RESPAWN, failures: [err, err, err] });
   const result = await processAlarm({ job, ...h.args });
   assert.equal(result.retry, true);
   assert.equal(job.pending.length, 1);
   assert.equal(h.state.notified.length, 0);
 });
 
-test("a retried alarm does not resend a reminder that already went out", async () => {
+test("a successful retry sends exactly one message and clears the failure marker", async () => {
   const job = makeJob();
-  // 5 min reminder sent OK, then the 1 min reminder (due too) cannot be sent
-  const early = harness({ nowMs: RESPAWN - 300000 });
-  await processAlarm({ job, ...early.args });
-  assert.equal(job.pending.length, 1);
   const err = new Error("503");
-  const failing = harness({ nowMs: RESPAWN - 60000, failures: [err, err, err] });
-  const first = await processAlarm({ job, ...failing.args });
-  assert.equal(first.retry, true);
-  const retry = harness({ nowMs: RESPAWN - 20000 });
-  const second = await processAlarm({ job, ...retry.args });
+  await processAlarm({ job, ...harness({ nowMs: RESPAWN, failures: [err, err, err] }).args });
+  assert.equal(Object.keys(job.failed).length, 1);
+  const retry = harness({ nowMs: RESPAWN + 5000 });
+  const result = await processAlarm({ job, ...retry.args });
   assert.equal(retry.state.sent.length, 1);
-  assert.match(retry.state.sent[0], /\*\*20 秒後\*\*出現/);
-  assert.equal(second.retry, false);
+  assert.equal(result.retry, false);
+  assert.deepEqual(job.failed, {});
+  assert.equal(retry.state.notified.length, 0);
+});
+
+test("final retry that still fails gives up and notifies once", async () => {
+  const job = makeJob();
+  const err = new Error("Discord Webhook failed: 503");
+  const h = harness({ nowMs: RESPAWN + 60000, failures: [err, err, err] });
+  const result = await processAlarm({ job, isLastRetry: true, ...h.args });
+  assert.equal(result.retry, false);
+  assert.equal(result.failed[0].reason, "gave-up");
+  assert.equal(h.state.notified.length, 1);
   assert.equal(job.pending.length, 0);
 });
 
-test("final retry that still fails gives up, notifies once and does not retry again", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[0], at: RESPAWN - 300000 }] });
-  const err = new Error("Discord Webhook failed: 503");
-  const h = harness({ nowMs: RESPAWN - 280000, failures: [err, err, err] });
-  const result = await processAlarm({ job, isLastRetry: true, ...h.args });
-  assert.equal(result.retry, false);
-  assert.equal(result.failed.length, 1);
-  assert.equal(h.state.notified.length, 1);
-  assert.equal(h.state.notified[0].bossName, "大象H");
-  assert.equal(job.pending.length, 0);
+test("failing past the 5 minute limit is reported as expired, never sent late", async () => {
+  const job = makeJob();
+  const err = new Error("503");
+  await processAlarm({ job, ...harness({ nowMs: RESPAWN, failures: [err, err, err] }).args });
+  const later = harness({ nowMs: RESPAWN + MAX_LATE_MS + 5000 });
+  const result = await processAlarm({ job, ...later.args });
+  assert.equal(later.state.calls, 0);
+  assert.equal(result.failed[0].reason, "expired-while-retrying");
+  assert.equal(later.state.notified.length, 1);
 });
 
 test("a permanent error (dead webhook) is not retried and notifies immediately", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[0], at: RESPAWN - 300000 }] });
+  const job = makeJob();
   const dead = Object.assign(new Error("Discord Webhook failed: 404"), { permanent: true });
-  const h = harness({ nowMs: RESPAWN - 300000, failures: [dead] });
+  const h = harness({ nowMs: RESPAWN, failures: [dead] });
   const result = await processAlarm({ job, ...h.args });
   assert.equal(h.state.calls, 1);
   assert.equal(result.retry, false);
@@ -171,99 +175,96 @@ test("a permanent error (dead webhook) is not retried and notifies immediately",
 });
 
 test("a failing alert channel never breaks the alarm", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[0], at: RESPAWN - 300000 }] });
+  const job = makeJob();
   const dead = Object.assign(new Error("404"), { permanent: true });
-  const h = harness({ nowMs: RESPAWN - 300000, failures: [dead] });
+  const h = harness({ nowMs: RESPAWN, failures: [dead] });
   h.args.notify = async () => { throw new Error("relay down"); };
   const result = await processAlarm({ job, ...h.args });
   assert.equal(result.failed.length, 1);
 });
 
-test("reminders that are not due yet are untouched", async () => {
-  const job = makeJob();
-  const h = harness({ nowMs: RESPAWN - 400000 });
-  const result = await processAlarm({ job, ...h.args });
+// ---- legacy jobs scheduled by the previous version (5 min / 1 min before) ----
+
+const legacy = (respawnMs, { fiveMin = true } = {}) => ({
+  version: 3,
+  chatId: "Cgroup",
+  bossKey: "x",
+  bossName: "舊王",
+  respawnAt: new Date(respawnMs).toISOString(),
+  pending: [
+    ...(fiveMin ? [{ beforeMs: 300000, label: "5 分鐘", icon: "🔥", at: respawnMs - 300000 }] : []),
+    { beforeMs: 60000, label: "1 分鐘", icon: "🚨", at: respawnMs - 60000 },
+  ],
+});
+
+test("legacy jobs are converted to a single respawn notification", () => {
+  const job = normalizeJob(legacy(RESPAWN), RESPAWN - 600000);
+  assert.equal(job.pending.length, 1);
+  assert.equal(job.pending[0].beforeMs, 0);
+  assert.equal(job.pending[0].at, RESPAWN);
+  assert.equal(job.pending[0].label, "已重生");
+});
+
+test("a legacy 5 minute alarm firing after deploy sends nothing and keeps the respawn one", async () => {
+  const job = legacy(RESPAWN);
+  const h = harness({ nowMs: RESPAWN - 300000 });
+  await processAlarm({ job, ...h.args });
+  assert.equal(h.state.calls, 0, "must not announce a respawn 5 minutes early");
+  assert.equal(job.pending.length, 1);
+  assert.equal(job.pending[0].at, RESPAWN);
+});
+
+test("a legacy 1 minute alarm firing after deploy sends nothing early", async () => {
+  const job = legacy(RESPAWN, { fiveMin: false });
+  const h = harness({ nowMs: RESPAWN - 60000 });
+  await processAlarm({ job, ...h.args });
   assert.equal(h.state.calls, 0);
-  assert.equal(result.sent.length + result.skipped.length, 0);
-  assert.equal(job.pending.length, 2);
+  assert.equal(job.pending[0].at, RESPAWN);
 });
 
-test("remainingLabel boundaries", () => {
-  assert.equal(remainingLabel(REMINDERS[0], 300000, 0), "5 分鐘");
-  assert.equal(remainingLabel(REMINDERS[0], 270000, 30000), "5 分鐘");
-  assert.equal(remainingLabel(REMINDERS[0], 269000, 31000), "5 分鐘".replace("5", String(Math.ceil(269000 / 60000))));
-  assert.equal(remainingLabel(REMINDERS[1], 59000, 31000), "59 秒");
-  assert.equal(remainingLabel(REMINDERS[1], 100, 59900), "1 秒");
+test("normalizing an already converted job changes nothing", () => {
+  const job = makeJob();
+  const before = JSON.stringify(job);
+  normalizeJob(job, RESPAWN - 1000);
+  assert.equal(JSON.stringify(job), before);
 });
 
-test("randomized timelines never send after respawn, never duplicate, never send two for one boss at once", async () => {
-  let seed = 12345;
+test("a finished job is never re-created by normalization", () => {
+  const job = makeJob({ pending: [] });
+  normalizeJob(job, RESPAWN + 1000);
+  assert.equal(job.pending.length, 0);
+});
+
+test("randomized timelines: one message per boss, never early, never later than 5 minutes", async () => {
+  let seed = 20261022;
   const rand = () => { seed = (seed * 1664525 + 1013904223) % 4294967296; return seed / 4294967296; };
-  for (let run = 0; run < 3000; run++) {
-    const job = makeJob();
-    const sentLabels = [];
-    let t = RESPAWN - 300000 + Math.floor(rand() * 20000);
+  for (let run = 0; run < 4000; run++) {
+    const job = rand() < 0.3 ? legacy(RESPAWN, { fiveMin: rand() < 0.5 }) : makeJob();
+    const sentAt = [];
+    let t = RESPAWN - Math.floor(rand() * 400000);
     let retryCount = 0;
-    let finished = false;
-    for (let step = 0; step < 12 && !finished; step++) {
+    for (let step = 0; step < 14; step++) {
       const failRate = rand() < 0.5 ? 0 : rand();
-      const state = { sent: 0 };
       const result = await processAlarm({
         job,
         now: () => t,
-        sleep: async () => { t += 10; },
+        sleep: async (ms) => { t += ms; },
         isLastRetry: retryCount >= 5,
-        send: async (text) => {
+        send: async () => {
           if (rand() < failRate) throw Object.assign(new Error("x"), { permanent: rand() < 0.1 });
-          assert.ok(t < RESPAWN, "sent at/after respawn");
-          state.sent++;
-          sentLabels.push(text);
+          sentAt.push(t);
         },
         persist: async () => {},
         notify: async () => {},
       });
-      assert.ok(state.sent <= 1, "more than one message in a single alarm");
       if (result.retry) { retryCount++; t += 2000 * 2 ** retryCount; }
-      else { retryCount = 0; finished = job.pending.length === 0; t += Math.floor(rand() * 150000); }
-      if (t > RESPAWN + 600000) break;
+      else { retryCount = 0; t += Math.floor(rand() * 200000); }
+      if (!job.pending.length) break;
     }
-    assert.equal(new Set(sentLabels).size, sentLabels.length, "duplicate message");
+    assert.ok(sentAt.length <= 1, "more than one notification for a boss");
+    for (const at of sentAt) {
+      assert.ok(at >= RESPAWN, "sent before the respawn time");
+      assert.ok(at - RESPAWN <= MAX_LATE_MS, "sent more than 5 minutes late");
+    }
   }
-});
-
-test("a reminder that keeps failing until the boss respawns is reported, not silently dropped", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[1], at: RESPAWN - 60000 }] });
-  const err = new Error("Discord Webhook failed: 503");
-  const first = harness({ nowMs: RESPAWN - 60000, failures: [err, err, err] });
-  const r1 = await processAlarm({ job, ...first.args });
-  assert.equal(r1.retry, true);
-  assert.ok(job.failed, "failure must be remembered for the next attempt");
-
-  const later = harness({ nowMs: RESPAWN + 20000 });
-  const r2 = await processAlarm({ job, ...later.args });
-  assert.equal(later.state.calls, 0, "never sends after respawn");
-  assert.equal(r2.failed.length, 1);
-  assert.equal(r2.failed[0].reason, "expired-while-retrying");
-  assert.equal(later.state.notified.length, 1);
-  assert.equal(later.state.notified[0].bossName, "大象H");
-  assert.equal(job.pending.length, 0);
-});
-
-test("recovery after a failure clears the failure marker and sends no alert", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[0], at: RESPAWN - 300000 }] });
-  const err = new Error("503");
-  await processAlarm({ job, ...harness({ nowMs: RESPAWN - 300000, failures: [err, err, err] }).args });
-  assert.ok(Object.keys(job.failed).length === 1);
-  const ok = harness({ nowMs: RESPAWN - 290000 });
-  await processAlarm({ job, ...ok.args });
-  assert.equal(ok.state.sent.length, 1);
-  assert.equal(ok.state.notified.length, 0);
-  assert.deepEqual(job.failed, {});
-});
-
-test("a normal respawn skip (no earlier failure) does not alert", async () => {
-  const job = makeJob({ pending: [{ ...REMINDERS[1], at: RESPAWN - 60000 }] });
-  const h = harness({ nowMs: RESPAWN + 1000 });
-  await processAlarm({ job, ...h.args });
-  assert.equal(h.state.notified.length, 0);
 });

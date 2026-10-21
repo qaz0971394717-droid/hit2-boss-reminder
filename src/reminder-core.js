@@ -1,12 +1,16 @@
 // Pure reminder logic (no Cloudflare imports) so it can be tested without a runtime.
+//
+// 每隻王只在「重生當下」發送一則 Discord 通知。
 
 export const REMINDERS = [
-  { beforeMs: 5 * 60 * 1000, label: "5 分鐘", icon: "🔥" },
-  { beforeMs: 1 * 60 * 1000, label: "1 分鐘", icon: "🚨" },
+  { beforeMs: 0, label: "已重生", icon: "⚔️" },
 ];
 
-// 鬧鐘晚響超過這個時間，就不再說原本的「5 分鐘後」，改用實際剩餘時間
-export const ON_TIME_MS = 30 * 1000;
+// 準時送出時，鬧鐘即使提早的毫秒數也會等到整點再送
+export const MAX_EARLY_WAIT_MS = 3 * 1000;
+
+// 晚超過這個時間就不補發，改通知維護者
+export const MAX_LATE_MS = 5 * 60 * 1000;
 
 // 單次 alarm 內對 Discord 的嘗試次數（失敗後 Cloudflare 還會再重試 alarm）
 export const SEND_ATTEMPTS = 3;
@@ -18,34 +22,45 @@ const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 
 // =========================================================
-// 提醒文字
+// 舊資料轉換
+//
+// 舊版會排「重生前 5 分鐘 / 1 分鐘」兩個提醒。
+// 部署後仍在排程中的舊工作，不能再發那兩種提醒，
+// 只保留「重生當下」這一則。
 // =========================================================
 
-export function remainingLabel(reminder, remainingMs, lateMs) {
-
-  // 準時：維持原本核准過的版面與文字
-  if (lateMs <= ON_TIME_MS) {
-    return reminder.label;
-  }
-
-  // 晚了：改說實際剩餘時間
-  if (remainingMs >= 60 * 1000) {
-    return `${Math.ceil(remainingMs / 60000)} 分鐘`;
-  }
-
-  return `${Math.max(1, Math.ceil(remainingMs / 1000))} 秒`;
-}
-
-
-export function buildReminderText(job, reminder, nowMs) {
+export function normalizeJob(job, nowMs = Date.now()) {
 
   const respawnMs = Date.parse(job.respawnAt);
 
-  const label = remainingLabel(
-    reminder,
-    respawnMs - nowMs,
-    nowMs - reminder.at
-  );
+  const hadLegacy = job.pending.some((r) => r.beforeMs !== 0);
+
+  job.pending = job.pending.filter((r) => r.beforeMs === 0);
+
+  if (
+    hadLegacy &&
+    !job.pending.length &&
+    Number.isFinite(respawnMs) &&
+    respawnMs > nowMs - MAX_LATE_MS
+  ) {
+
+    job.pending.push({
+      ...REMINDERS[0],
+      at: respawnMs,
+    });
+  }
+
+  return job;
+}
+
+
+// =========================================================
+// 提醒文字
+//
+// 一律寫出「真正的重生時間」，就算晚幾秒送出也不會誤導。
+// =========================================================
+
+export function buildReminderText(job) {
 
   const time = new Intl.DateTimeFormat(
     "zh-TW",
@@ -56,12 +71,11 @@ export function buildReminderText(job, reminder, nowMs) {
       second: "2-digit",
       hour12: false,
     }
-  ).format(new Date(respawnMs));
+  ).format(new Date(job.respawnAt));
 
   return (
-    `${reminder.icon} **BOSS 出現提醒**\n` +
-    `**${job.bossName}** 即將於 **${label}後**出現\n` +
-    `⏰ 出現時間：**${time}**`
+    `⚔️ **${job.bossName} 已重生**\n` +
+    `⏰ 重生時間：**${time}**`
   );
 }
 
@@ -111,8 +125,8 @@ export async function sendWithRetry(
 // 處理一次 alarm
 //
 // 規則：
-// 1. 王已經重生就不發
-// 2. 同時到期的多則提醒只發最後一則（前面的已過時）
+// 1. 到了重生時間才發（鬧鐘稍早會等到整點）
+// 2. 晚超過 5 分鐘就不補發，改通知維護者
 // 3. 每處理完一則就先存檔，重試時不會重複發送
 // 4. 發送失敗：先重試，最後一次仍失敗才放棄並通知
 // =========================================================
@@ -135,12 +149,12 @@ export async function processAlarm({
     retry: false,
   };
 
-  const respawnMs = Date.parse(job.respawnAt);
+  normalizeJob(job, now());
 
   const startedAt = now();
 
   const due = job.pending
-    .filter((r) => r.at <= startedAt + 3000)
+    .filter((r) => r.at <= startedAt + MAX_EARLY_WAIT_MS)
     .sort((a, b) => a.at - b.at);
 
   const drop = async (reminder) => {
@@ -179,53 +193,36 @@ export async function processAlarm({
     }
   };
 
-  for (let i = 0; i < due.length; i++) {
+  for (const reminder of due) {
 
-    const reminder = due[i];
+    // 稍早到的鬧鐘：等到整點再發，時間才準
+    const early = reminder.at - now();
 
-    const current = now();
+    if (early > 0) {
+      await sleep(early);
+    }
 
-    // 已經重生
-    if (respawnMs - current <= 0) {
+    const lateMs = now() - reminder.at;
 
-      // 先前發送失敗、重試到王都重生了還沒送出去：不能悄悄放棄
+    // 晚太多：不補發（過時的「已重生」沒有意義），但要讓維護者知道
+    if (lateMs > MAX_LATE_MS) {
+
       const earlier = job.failed?.[reminder.at];
 
-      if (earlier) {
-
-        await reportFailure(reminder, earlier, "expired-while-retrying");
-
-      } else {
-
-        result.skipped.push({
-          label: reminder.label,
-          reason: "respawned",
-        });
-      }
-
       await drop(reminder);
+
+      await reportFailure(
+        reminder,
+        earlier ?? `late ${Math.round(lateMs / 1000)}s`,
+        earlier ? "expired-while-retrying" : "too-late"
+      );
 
       continue;
     }
-
-    // 後面還有更接近的提醒，這則已過時
-    if (i < due.length - 1) {
-
-      result.skipped.push({
-        label: reminder.label,
-        reason: "superseded",
-      });
-
-      await drop(reminder);
-
-      continue;
-    }
-
-    const text = buildReminderText(job, reminder, current);
 
     const outcome = await sendWithRetry(
       send,
-      text,
+      buildReminderText(job),
       { attempts, sleep }
     );
 

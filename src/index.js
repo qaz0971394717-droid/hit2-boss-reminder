@@ -130,7 +130,11 @@ async function notifyOps(env, failure) {
         target: "production",
         kind: "alert",
         message:
-          `Discord 提醒未送出：${failure.bossName}（${failure.label}前）`,
+          `Discord 重生通知未送出：${failure.bossName}（${
+            failure.reason === "gave-up"
+              ? "重試後仍失敗"
+              : "已逾時超過 5 分鐘"
+          }）`,
         retryKey,
       }),
       signal: AbortSignal.timeout(15000),
@@ -469,6 +473,12 @@ export class BossReminder extends DurableObject {
     // -------------------------------------------------------
 
     if (job.pending.length) {
+
+      // 舊版排程轉換後的內容也要存回去
+      await this.ctx.storage.put(
+        "job",
+        job
+      );
 
       await this.setNextAlarm(
         job
